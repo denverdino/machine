@@ -75,6 +75,10 @@
 			"Rev": "d1b9a8cb38329433b67c9bf00ad11f39ef39d3ef"
 		},
 		{
+			"ImportPath": "github.com/denverdino/aliyungo/slb",
+			"Rev": "d1b9a8cb38329433b67c9bf00ad11f39ef39d3ef"
+		},
+		{
 			"ImportPath": "github.com/denverdino/aliyungo/common",
 			"Rev": "d1b9a8cb38329433b67c9bf00ad11f39ef39d3ef"
 		},
