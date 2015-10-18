@@ -69,17 +69,17 @@ func getTestStorePath() (string, error) {
 func getDefaultTestDriverFlags() *DriverOptionsMock {
 	return &DriverOptionsMock{
 		Data: map[string]interface{}{
-			"name":             "test",
-			"url":              "unix:///var/run/docker.sock",
-			"swarm":            false,
-			"swarm-host":       "",
-			"swarm-master":     false,
-			"swarm-discovery":  "",
-			"aliyunecs-region": "cn-hangzhou",
-
+			"name":                        "test",
+			"url":                         "unix:///var/run/docker.sock",
+			"swarm":                       false,
+			"swarm-host":                  "",
+			"swarm-master":                false,
+			"swarm-discovery":             "",
+			"aliyunecs-region":            "cn-hangzhou",
 			"aliyunecs-image-id":          "img-12345",
 			"aliyunecs-access-key-id":     "abcdefg",
 			"aliyunecs-access-key-secret": "12345",
+			"aliyunecs-tag":               []string{"a=tag1", "b=tag2"},
 		},
 	}
 }
@@ -93,7 +93,9 @@ func TestSetConfigFromFlags(t *testing.T) {
 			"swarm-host":              "",
 			"swarm-master":            false,
 			"swarm-discovery":         "",
+			"aliyunecs-region":        "cn-hangzhou",
 			"aliyunecs-access-key-id": "abcdefg",
+			"aliyunecs-tag":           []string{"a=tag1", "b=tag2"},
 		},
 	}
 

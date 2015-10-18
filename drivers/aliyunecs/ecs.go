@@ -7,6 +7,7 @@ import (
 
 	"github.com/denverdino/aliyungo/common"
 	"github.com/denverdino/aliyungo/ecs"
+	"github.com/denverdino/aliyungo/slb"
 
 	"io"
 	"io/ioutil"
@@ -66,7 +67,13 @@ type Driver struct {
 	PrivateIPOnly           bool
 	InternetMaxBandwidthOut int
 	RouteCIDR               string
+	SLBID                   string
+	SLBIPAddress            string
+	Tags                    map[string]string
+	DiskSize                int
+	DiskCategory            ecs.DiskCategory
 	client                  *ecs.Client
+	slbClient               *slb.Client
 }
 
 func (d *Driver) GetCreateFlags() []mcnflag.Flag {
@@ -147,13 +154,30 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		},
 		mcnflag.StringFlag{
 			Name:   "aliyunecs-route-cidr",
-			Usage:  "Destination CIDR for route entry",
+			Usage:  "Docker bridge CIDR for route entry in VPC",
 			EnvVar: "ECS_ROUTE_CIDR",
 		},
 		mcnflag.StringFlag{
-			Name:   "aliyunecs-slb-ip",
-			Usage:  "SLB IP address for Swarm cluster management endpoint",
-			EnvVar: "ECS_SLB_IP",
+			Name:   "aliyunecs-slb-id",
+			Usage:  "SLB id for instance association",
+			EnvVar: "ECS_SLB_ID",
+		},
+		mcnflag.StringSliceFlag{
+			Name:   "aliyunecs-tag",
+			Usage:  "Tags for instance",
+			Value:  []string{},
+			EnvVar: "ECS_TAGS",
+		},
+		mcnflag.IntFlag{
+			Name:   "aliyunecs-disk-size",
+			Usage:  "Data disk size for instance in GB",
+			Value:  0,
+			EnvVar: "ECS_DISK_SIZE",
+		},
+		mcnflag.StringFlag{
+			Name:   "aliyunecs-disk-category",
+			Usage:  "Data disk category for instance",
+			EnvVar: "ECS_DISK_CATEGORY",
 		},
 	}
 }
@@ -220,17 +244,39 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.VSwitchId = flags.String("aliyunecs-vswitch-id")
 	d.SecurityGroupName = flags.String("aliyunecs-security-group")
 
-	zone := flags.String("aliyunecs-zone")
-	d.Zone = zone[:]
+	d.Zone = flags.String("aliyunecs-zone")
 	d.SwarmMaster = flags.Bool("swarm-master")
 	d.SwarmHost = flags.String("swarm-host")
 	d.SwarmDiscovery = flags.String("swarm-discovery")
-	d.SSHUser = "root" //TODO support non-root
+	d.SSHUser = defaultSSHUser
 	d.SSHPassword = flags.String("aliyunecs-ssh-password")
 	d.SSHPort = 22
 	d.PrivateIPOnly = flags.Bool("aliyunecs-private-address-only")
 	d.InternetMaxBandwidthOut = flags.Int("aliyunecs-internet-max-bandwidth")
 	d.RouteCIDR = flags.String("aliyunecs-route-cidr")
+	d.SLBID = flags.String("aliyunecs-slb-id")
+	d.DiskSize = flags.Int("aliyunecs-disk-size")
+	d.DiskCategory = ecs.DiskCategory(flags.String("aliyunecs-disk-category"))
+	tags := flags.StringSlice("aliyunecs-tag")
+
+	tagMap := make(map[string]string)
+	if len(tags) > 0 {
+		for _, tag := range tags {
+			s := strings.Split(tag, "=")
+			if len(s) != 2 {
+				log.Infof("%s | Invalid tag for --aliyunecs-tag", tag)
+				return fmt.Errorf("%s | Invalid tag for --aliyunecs-tag", tag)
+			}
+			k := strings.TrimSpace(s[0])
+			v := strings.TrimSpace(s[1])
+			tagMap[k] = v
+		}
+	}
+
+	if len(tagMap) > 0 {
+		d.Tags = tagMap
+	}
+
 	if d.RouteCIDR != "" {
 		_, _, err := net.ParseCIDR(d.RouteCIDR)
 		if err != nil {
@@ -283,6 +329,14 @@ func (d *Driver) DriverName() string {
 }
 
 func (d *Driver) checkPrereqs() error {
+
+	if d.SLBID != "" {
+		loadBalancer, err := d.getSLBClient().DescribeLoadBalancerAttribute(d.SLBID)
+		if err != nil {
+			return fmt.Errorf("%s | Invalid --aliyunecs-slb-id: %v", d.MachineName, err)
+		}
+		d.SLBIPAddress = loadBalancer.Address
+	}
 	return nil
 }
 
@@ -323,6 +377,7 @@ func (d *Driver) Create() error {
 
 	args := ecs.CreateInstanceArgs{
 		RegionId:           d.Region,
+		InstanceName:       d.GetMachineName(),
 		ImageId:            imageID,
 		InstanceType:       d.InstanceType,
 		SecurityGroupId:    d.SecurityGroupId,
@@ -331,6 +386,21 @@ func (d *Driver) Create() error {
 		VSwitchId:          VSwitchId,
 		ZoneId:             d.Zone,
 		ClientToken:        d.getClient().GenerateClientToken(),
+	}
+
+	if d.DiskSize > 0 { // Allocate Data Disk
+
+		disk := ecs.DataDiskType{
+			DiskName:           d.MachineName + "_data",
+			Description:        "Data volume for Docker",
+			Size:               d.DiskSize,
+			Category:           d.DiskCategory,
+			Device:             "/dev/xvdb",
+			DeleteWithInstance: true,
+		}
+
+		args.DataDisk = []ecs.DataDiskType{disk}
+
 	}
 
 	// Set InternetMaxBandwidthOut only for classic network
@@ -358,20 +428,8 @@ func (d *Driver) Create() error {
 		log.Error(err)
 	}
 
-	// Assign public IP if not private IP only
-	if err == nil && !d.PrivateIPOnly {
-		if VSwitchId == "" {
-			// Allocate public IP address for classic network
-			var ipAddress string
-			ipAddress, err = d.getClient().AllocatePublicIpAddress(instanceId)
-			if err != nil {
-				err = fmt.Errorf("%s | Error allocate public IP address for instance %s: %v", d.MachineName, instanceId, err)
-			} else {
-				log.Infof("%s | Allocate publice IP address %s for instance %s successfully", d.MachineName, ipAddress, instanceId)
-			}
-		} else {
-			err = d.configNetwork(VpcId, instanceId)
-		}
+	if err == nil {
+		err = d.configNetwork(VpcId, instanceId)
 	}
 
 	if err == nil {
@@ -410,6 +468,21 @@ func (d *Driver) Create() error {
 		}
 	}
 
+	// Add instance tags
+	if len(d.Tags) > 0 {
+		log.Infof("%s | Adding tags %v to instance %s ...", d.MachineName, d.Tags, instanceId)
+		args := ecs.AddTagsArgs{
+			RegionId:     d.Region,
+			ResourceId:   instanceId,
+			ResourceType: ecs.TagResourceInstance,
+			Tag:          d.Tags,
+		}
+		err2 := d.getClient().AddTags(&args)
+		if err2 != nil {
+			log.Warnf("%s | Failed to add tags %v to instance %s: %v", d.MachineName, d.Tags, instanceId, err)
+		}
+	}
+
 	if err != nil {
 		log.Warn(err)
 		d.Remove()
@@ -419,40 +492,71 @@ func (d *Driver) Create() error {
 }
 
 func (d *Driver) configNetwork(vpcId string, instanceId string) error {
-	err := d.addRouteEntry(vpcId)
-	if err != nil {
-		return fmt.Errorf("%s | Failed to add route entry: %v", d.MachineName, err)
-	}
+	var err error
+	if vpcId == "" {
+		// Assign public IP if not private IP only
 
-	// Create EIP for virtual private cloud
-	eipArgs := ecs.AllocateEipAddressArgs{
-		RegionId:    d.Region,
-		Bandwidth:   d.InternetMaxBandwidthOut,
-		ClientToken: d.getClient().GenerateClientToken(),
-	}
-	log.Infof("%s | Allocating Eip address for instance %s ...", d.MachineName, instanceId)
-
-	_, allocationId, err := d.getClient().AllocateEipAddress(&eipArgs)
-	if err != nil {
-		return fmt.Errorf("%s | Failed to allocate EIP address: %v", d.MachineName, err)
-	}
-	err = d.getClient().WaitForEip(d.Region, allocationId, ecs.EipStatusAvailable, 60)
-	if err != nil {
-		log.Infof("%s | Releasing Eip address %s for ...", d.MachineName, allocationId)
-		err2 := d.getClient().ReleaseEipAddress(allocationId)
-		if err2 != nil {
-			log.Warnf("%s | Failed to release EIP address: %v", d.MachineName, err2)
+		if !d.PrivateIPOnly {
+			// Allocate public IP address for classic network
+			var ipAddress string
+			ipAddress, err = d.getClient().AllocatePublicIpAddress(instanceId)
+			if err != nil {
+				err = fmt.Errorf("%s | Error allocate public IP address for instance %s: %v", d.MachineName, instanceId, err)
+			} else {
+				log.Infof("%s | Allocate publice IP address %s for instance %s successfully", d.MachineName, ipAddress, instanceId)
+			}
 		}
-		return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
+	} else {
+		err := d.addRouteEntry(vpcId)
+		if err != nil {
+			return err
+		}
+		if !d.PrivateIPOnly {
+			// Create EIP for virtual private cloud
+			eipArgs := ecs.AllocateEipAddressArgs{
+				RegionId:    d.Region,
+				Bandwidth:   d.InternetMaxBandwidthOut,
+				ClientToken: d.getClient().GenerateClientToken(),
+			}
+			log.Infof("%s | Allocating Eip address for instance %s ...", d.MachineName, instanceId)
+
+			_, allocationId, err := d.getClient().AllocateEipAddress(&eipArgs)
+			if err != nil {
+				return fmt.Errorf("%s | Failed to allocate EIP address: %v", d.MachineName, err)
+			}
+			err = d.getClient().WaitForEip(d.Region, allocationId, ecs.EipStatusAvailable, 60)
+			if err != nil {
+				log.Infof("%s | Releasing Eip address %s for ...", d.MachineName, allocationId)
+				err2 := d.getClient().ReleaseEipAddress(allocationId)
+				if err2 != nil {
+					log.Warnf("%s | Failed to release EIP address: %v", d.MachineName, err2)
+				}
+				return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
+			}
+			log.Infof("%s | Associating Eip address %s for instance %s ...", d.MachineName, allocationId, instanceId)
+			err = d.getClient().AssociateEipAddress(allocationId, instanceId)
+			if err != nil {
+				return fmt.Errorf("%s | Failed to associate EIP address: %v", d.MachineName, err)
+			}
+			err = d.getClient().WaitForEip(d.Region, allocationId, ecs.EipStatusInUse, 60)
+			if err != nil {
+				return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
+			}
+		}
 	}
-	log.Infof("%s | Associating Eip address %s for instance %s ...", d.MachineName, allocationId, instanceId)
-	err = d.getClient().AssociateEipAddress(allocationId, instanceId)
-	if err != nil {
-		return fmt.Errorf("%s | Failed to associate EIP address: %v", d.MachineName, err)
-	}
-	err = d.getClient().WaitForEip(d.Region, allocationId, ecs.EipStatusInUse, 60)
-	if err != nil {
-		return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
+
+	if d.SLBID != "" { // Add the instance to SLB
+		log.Infof("%s | Adding instance %s to SLB %s ...", d.MachineName, instanceId, d.SLBID)
+		backendServers := []slb.BackendServerType{
+			slb.BackendServerType{
+				ServerId: instanceId,
+				Weight:   100,
+			},
+		}
+		_, err = d.getSLBClient().AddBackendServers(d.SLBID, backendServers)
+		if err != nil {
+			return fmt.Errorf("%s | Failed to add instance to SLB: %v", d.MachineName, err)
+		}
 	}
 	return nil
 }
@@ -741,6 +845,15 @@ func (d *Driver) Kill() error {
 	return nil
 }
 
+func (d *Driver) getSLBClient() *slb.Client {
+	if d.slbClient == nil {
+		client := slb.NewClient(d.AccessKey, d.SecretKey)
+		client.SetDebug(false)
+		d.slbClient = client
+	}
+	return d.slbClient
+}
+
 func (d *Driver) getClient() *ecs.Client {
 	if d.client == nil {
 		client := ecs.NewClient(d.AccessKey, d.SecretKey)
@@ -756,7 +869,7 @@ func (d *Driver) getInstance() (*ecs.InstanceAttributesType, error) {
 
 func (d *Driver) createKeyPair() error {
 
-	log.Debug("%s | SSH key path: ", d.MachineName, d.GetSSHKeyPath())
+	log.Debugf("%s | SSH key path: %s", d.MachineName, d.GetSSHKeyPath())
 
 	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 		return err
@@ -898,9 +1011,8 @@ func (d *Driver) configureSecurityGroupPermissions(group *ecs.DescribeSecurityGr
 	hasAllIncomingPort := false
 	for _, p := range group.Permissions.Permission {
 		portRange := strings.Split(p.PortRange, "/")
-		//log.Debugf("Permission : %++v", p)
 
-		log.Debug("%s | portRange", d.MachineName, portRange)
+		log.Debugf("%s | portRange %v", d.MachineName, portRange)
 		fromPort, _ := strconv.Atoi(portRange[0])
 		switch fromPort {
 		case -1:
@@ -1015,6 +1127,10 @@ func (d *Driver) uploadKeyPair() error {
 
 	d.fixRoutingRules(sshClient)
 
+	if d.DiskSize > 0 {
+		d.autoFdisk(sshClient)
+	}
+
 	return nil
 }
 
@@ -1028,4 +1144,12 @@ func (d *Driver) fixRoutingRules(sshClient ssh.Client) {
 
 	output, err = sshClient.Output("if [ -e /etc/sysconfig/network-scripts/route-eth0 ]; then sed -i -r 's/^(172\\.16\\.0\\.0\\..* dev eth0)$/#\\1/' /etc/sysconfig/network-scripts/route-eth0; fi")
 	log.Debugf("%s | Fix route in /etc/sysconfig/network-scripts/route-eth0 command err, output: %v: %s", d.MachineName, err, output)
+}
+
+// Mount the addtional disk
+func (d *Driver) autoFdisk(sshClient ssh.Client) {
+	script := fmt.Sprintf("cat > ~/machine_autofdisk.sh <<MACHINE_EOF\n%s\nMACHINE_EOF\n", autoFdiskScript)
+	output, err := sshClient.Output(script)
+	output, err = sshClient.Output("bash ~/machine_autofdisk.sh")
+	log.Debugf("%s | Delete route command err, output: %v: %s", d.MachineName, err, output)
 }
