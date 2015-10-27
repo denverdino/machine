@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"fmt"
+	mrand "math/rand"
 
 	"github.com/denverdino/aliyungo/common"
 	"github.com/denverdino/aliyungo/ecs"
@@ -71,6 +72,7 @@ type Driver struct {
 	SLBIPAddress            string
 	Tags                    map[string]string
 	DiskSize                int
+	UpgradeKernel           bool
 	DiskCategory            ecs.DiskCategory
 	client                  *ecs.Client
 	slbClient               *slb.Client
@@ -143,8 +145,9 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "ECS_SSH_PASSWORD",
 		},
 		mcnflag.BoolFlag{
-			Name:  "aliyunecs-private-address-only",
-			Usage: "Only use a private IP address",
+			Name:   "aliyunecs-private-address-only",
+			EnvVar: "ECS_PRIVATE_ADDR_ONLY",
+			Usage:  "Only use a private IP address",
 		},
 		mcnflag.IntFlag{
 			Name:   "aliyunecs-internet-max-bandwidth",
@@ -178,6 +181,11 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "aliyunecs-disk-category",
 			Usage:  "Data disk category for instance",
 			EnvVar: "ECS_DISK_CATEGORY",
+		},
+		mcnflag.BoolFlag{
+			Name:   "aliyunecs-upgrade-kernel",
+			Usage:  "Upgrade kernel for instance",
+			EnvVar: "ECS_UPGRADE_KERNEL",
 		},
 	}
 }
@@ -258,6 +266,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.DiskSize = flags.Int("aliyunecs-disk-size")
 	d.DiskCategory = ecs.DiskCategory(flags.String("aliyunecs-disk-category"))
 	tags := flags.StringSlice("aliyunecs-tag")
+	d.UpgradeKernel = flags.Bool("aliyunecs-upgrade-kernel")
 
 	tagMap := make(map[string]string)
 	if len(tags) > 0 {
@@ -445,7 +454,7 @@ func (d *Driver) Create() error {
 
 				if err == nil {
 					d.Zone = instance.ZoneId
-					d.PrivateIPAddress = d.getPrivateIP(instance)
+					d.PrivateIPAddress = d.GetPrivateIP(instance)
 
 					d.IPAddress = d.getIP(instance)
 
@@ -547,15 +556,25 @@ func (d *Driver) configNetwork(vpcId string, instanceId string) error {
 
 	if d.SLBID != "" { // Add the instance to SLB
 		log.Infof("%s | Adding instance %s to SLB %s ...", d.MachineName, instanceId, d.SLBID)
-		backendServers := []slb.BackendServerType{
-			slb.BackendServerType{
-				ServerId: instanceId,
-				Weight:   100,
-			},
-		}
-		_, err = d.getSLBClient().AddBackendServers(d.SLBID, backendServers)
-		if err != nil {
-			return fmt.Errorf("%s | Failed to add instance to SLB: %v", d.MachineName, err)
+		count := 0
+		for {
+			backendServers := []slb.BackendServerType{
+				slb.BackendServerType{
+					ServerId: instanceId,
+					Weight:   100,
+				},
+			}
+			_, err = d.getSLBClient().AddBackendServers(d.SLBID, backendServers)
+			if err != nil {
+				log.Errorf("%s | Failed to add instance to SLB: %v", d.MachineName, err)
+				if count <= maxRetry {
+					time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
+					continue
+				} else {
+					return fmt.Errorf("%s | Failed to delete route entry after %d times", d.MachineName, maxRetry)
+				}
+			}
+			break
 		}
 	}
 	return nil
@@ -579,24 +598,20 @@ func (d *Driver) removeRouteEntry(vpcId string, regionId common.Region, instance
 	describeRouteTablesArgs := ecs.DescribeRouteTablesArgs{
 		VRouterId: vrouterId,
 	}
-	count := 0
 
-	for {
-		found := false
+	routeTables, _, err := client.DescribeRouteTables(&describeRouteTablesArgs)
+	if err != nil {
+		return fmt.Errorf("%s | Failed to describe route tables: %v", d.MachineName, err)
+	}
 
-		routeTables, _, err := client.DescribeRouteTables(&describeRouteTablesArgs)
-		if err != nil {
-			return fmt.Errorf("%s | Failed to describe route tables: %v", d.MachineName, err)
-		}
+	routeEntries := routeTables[0].RouteEntrys.RouteEntry
 
-		routeEntries := routeTables[0].RouteEntrys.RouteEntry
+	// Find route entry associated with instance
+	for _, routeEntry := range routeEntries {
+		count := 0
 
-		// Find route entry associated with instance
-		for _, routeEntry := range routeEntries {
-			log.Debugf("Route Entry %++v\n", routeEntry)
-
-			if routeEntry.InstanceId == instanceId {
-				found = true
+		if routeEntry.InstanceId == instanceId {
+			for {
 				deleteArgs := ecs.DeleteRouteEntryArgs{
 					RouteTableId:         routeEntry.RouteTableId,
 					DestinationCidrBlock: routeEntry.DestinationCidrBlock,
@@ -607,19 +622,16 @@ func (d *Driver) removeRouteEntry(vpcId string, regionId common.Region, instance
 				err := client.DeleteRouteEntry(&deleteArgs)
 				if err != nil {
 					log.Errorf("%s | Failed to delete route entry: %v", d.MachineName, err)
+					count++
+					if count <= maxRetry {
+						time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
+						continue
+					} else {
+						return fmt.Errorf("%s | Failed to delete route entry after %d times", d.MachineName, maxRetry)
+					}
 				}
-				break
+				return nil
 			}
-		}
-		if found { // Wait route entry be removed
-			count++
-			if count <= maxRetry {
-				time.Sleep(5 * time.Second)
-			} else {
-				return fmt.Errorf("%s | Failed to delete route entry after %d times", d.MachineName, maxRetry)
-			}
-		} else {
-			break
 		}
 	}
 	return nil
@@ -648,17 +660,16 @@ func (d *Driver) addRouteEntry(vpcId string) error {
 			return fmt.Errorf("%s | Failed to describe VRouters: %v", d.MachineName, err)
 		}
 		routeTableId := vrouters[0].RouteTableIds.RouteTableId[0]
-		createArgs := ecs.CreateRouteEntryArgs{
-			RouteTableId:         routeTableId,
-			DestinationCidrBlock: d.RouteCIDR,
-			NextHopType:          ecs.NextHopIntance,
-			NextHopId:            d.InstanceId,
-			ClientToken:          client.GenerateClientToken(),
-		}
-
 		count := 0
 
 		for {
+			createArgs := ecs.CreateRouteEntryArgs{
+				RouteTableId:         routeTableId,
+				DestinationCidrBlock: d.RouteCIDR,
+				NextHopType:          ecs.NextHopIntance,
+				NextHopId:            d.InstanceId,
+				ClientToken:          client.GenerateClientToken(),
+			}
 			err = client.CreateRouteEntry(&createArgs)
 			if err == nil {
 				break
@@ -669,7 +680,7 @@ func (d *Driver) addRouteEntry(vpcId string) error {
 			if ecsErr != nil && (ecsErr.StatusCode == 500 || (ecsErr.StatusCode == 400 && ecsErr.Code == "IncorrectRouteEntryStatus")) {
 				count++
 				if count <= maxRetry {
-					time.Sleep(5 * time.Second)
+					time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
 					continue
 				}
 
@@ -700,7 +711,7 @@ func (d *Driver) GetIP() (string, error) {
 	return d.getIP(inst), nil
 }
 
-func (d *Driver) getPrivateIP(inst *ecs.InstanceAttributesType) string {
+func (d *Driver) GetPrivateIP(inst *ecs.InstanceAttributesType) string {
 	if inst.InnerIpAddress.IpAddress != nil && len(inst.InnerIpAddress.IpAddress) > 0 {
 		return inst.InnerIpAddress.IpAddress[0]
 	}
@@ -713,7 +724,7 @@ func (d *Driver) getPrivateIP(inst *ecs.InstanceAttributesType) string {
 
 func (d *Driver) getIP(inst *ecs.InstanceAttributesType) string {
 	if d.PrivateIPOnly {
-		return d.getPrivateIP(inst)
+		return d.GetPrivateIP(inst)
 	}
 	if inst.PublicIpAddress.IpAddress != nil && len(inst.PublicIpAddress.IpAddress) > 0 {
 		return inst.PublicIpAddress.IpAddress[0]
@@ -782,6 +793,8 @@ func (d *Driver) Stop() error {
 }
 
 func (d *Driver) Remove() error {
+	log.Infof("%s | Remove instance %s ...", d.MachineName, d.InstanceId)
+
 	if d.InstanceId == "" {
 		return fmt.Errorf("%s | Unknown instance id", d.MachineName)
 	}
@@ -824,7 +837,7 @@ func (d *Driver) Remove() error {
 		}
 	}
 
-	log.Debugf("%s | Deleting instance: %s", d.MachineName, d.InstanceId)
+	log.Infof("%s | Deleting instance: %s", d.MachineName, d.InstanceId)
 	if err := d.getClient().DeleteInstance(d.InstanceId); err != nil {
 		return fmt.Errorf("%s | Unable to delete instance %s: %s", d.MachineName, d.InstanceId, err)
 	}
@@ -839,6 +852,8 @@ func (d *Driver) Restart() error {
 }
 
 func (d *Driver) Kill() error {
+	log.Debugf("%s | Killing instance ...", d.MachineName)
+
 	if err := d.getClient().StopInstance(d.InstanceId, true); err != nil {
 		return fmt.Errorf("%s | Unable to kill instance %s: %s", d.MachineName, d.InstanceId, err)
 	}
@@ -1131,6 +1146,10 @@ func (d *Driver) uploadKeyPair() error {
 		d.autoFdisk(sshClient)
 	}
 
+	if d.UpgradeKernel {
+		d.upgradeKernel(sshClient, tcpAddr)
+	}
+
 	return nil
 }
 
@@ -1139,10 +1158,10 @@ func (d *Driver) fixRoutingRules(sshClient ssh.Client) {
 	output, err := sshClient.Output("route del -net 172.16.0.0/12")
 	log.Debugf("%s | Delete route command err, output: %v: %s", d.MachineName, err, output)
 
-	output, err = sshClient.Output("if [ -e /etc/network/interfaces ]; then sed -i -r 's/^(up route add \\-net 172\\.16\\.0\\.0\\..*)$/#\\1/' /etc/network/interfaces; fi")
+	output, err = sshClient.Output("if [ -e /etc/network/interfaces ]; then sed -i '/^up route add -net 172.16.0.0 netmask 255.240.0.0 gw/d' /etc/network/interfaces; fi")
 	log.Debugf("%s | Fix route in /etc/network/interfaces command err, output: %v: %s", d.MachineName, err, output)
 
-	output, err = sshClient.Output("if [ -e /etc/sysconfig/network-scripts/route-eth0 ]; then sed -i -r 's/^(172\\.16\\.0\\.0\\..* dev eth0)$/#\\1/' /etc/sysconfig/network-scripts/route-eth0; fi")
+	output, err = sshClient.Output("if [ -e /etc/sysconfig/network-scripts/route-eth0 ]; then sed -i '/^172.16.0.0\\/12 via /d' /etc/sysconfig/network-scripts/route-eth0; fi")
 	log.Debugf("%s | Fix route in /etc/sysconfig/network-scripts/route-eth0 command err, output: %v: %s", d.MachineName, err, output)
 }
 
@@ -1151,5 +1170,19 @@ func (d *Driver) autoFdisk(sshClient ssh.Client) {
 	script := fmt.Sprintf("cat > ~/machine_autofdisk.sh <<MACHINE_EOF\n%s\nMACHINE_EOF\n", autoFdiskScript)
 	output, err := sshClient.Output(script)
 	output, err = sshClient.Output("bash ~/machine_autofdisk.sh")
-	log.Debugf("%s | Delete route command err, output: %v: %s", d.MachineName, err, output)
+	log.Debugf("%s | Auto Fdisk command err, output: %v: %s", d.MachineName, err, output)
+}
+
+// Install Kernel 3.19
+func (d *Driver) upgradeKernel(sshClient ssh.Client, tcpAddr string) {
+	log.Debugf("%s | Upgrade kernel version ...", d.MachineName)
+	output, err := sshClient.Output("for i in 1 2 3 4 5; do apt-get update -y && break || sleep 5; done")
+	log.Infof("%s | apt-get update update err, output: %v: %s", d.MachineName, err, output)
+	output, err = sshClient.Output("for i in 1 2 3 4 5; do apt-get install -y linux-generic-lts-vivid && break || sleep 5; done")
+	log.Infof("%s | Upgrade kernel err, output: %v: %s", d.MachineName, err, output)
+	time.Sleep(5 * time.Second)
+	log.Infof("%s | Restart VM instance for kernel update ...", d.MachineName)
+	d.Restart()
+	time.Sleep(30 * time.Second)
+	sshClient.Output("echo 'I am back'")
 }
