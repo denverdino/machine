@@ -492,11 +492,6 @@ func (d *Driver) Create() error {
 		}
 	}
 
-	if err != nil {
-		log.Warn(err)
-		d.Remove()
-	}
-
 	return err
 }
 
@@ -567,6 +562,7 @@ func (d *Driver) configNetwork(vpcId string, instanceId string) error {
 			_, err = d.getSLBClient().AddBackendServers(d.SLBID, backendServers)
 			if err != nil {
 				log.Errorf("%s | Failed to add instance to SLB: %v", d.MachineName, err)
+				count++
 				if count <= maxRetry {
 					time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
 					continue
@@ -841,6 +837,10 @@ func (d *Driver) Remove() error {
 	if err := d.getClient().DeleteInstance(d.InstanceId); err != nil {
 		return fmt.Errorf("%s | Unable to delete instance %s: %s", d.MachineName, d.InstanceId, err)
 	}
+	d.InstanceId = ""
+	d.IPAddress = ""
+	d.PrivateIPAddress = ""
+	d.Zone = ""
 	return nil
 }
 
@@ -1184,5 +1184,4 @@ func (d *Driver) upgradeKernel(sshClient ssh.Client, tcpAddr string) {
 	log.Infof("%s | Restart VM instance for kernel update ...", d.MachineName)
 	d.Restart()
 	time.Sleep(30 * time.Second)
-	sshClient.Output("echo 'I am back'")
 }
