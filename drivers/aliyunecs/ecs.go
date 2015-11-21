@@ -74,8 +74,13 @@ type Driver struct {
 	DiskSize                int
 	UpgradeKernel           bool
 	DiskCategory            ecs.DiskCategory
-	client                  *ecs.Client
-	slbClient               *slb.Client
+	Description             string
+	IoOptimized             bool
+	APIEndpoint             string
+	SystemDiskCategory      ecs.DiskCategory
+
+	client    *ecs.Client
+	slbClient *slb.Client
 }
 
 func (d *Driver) GetCreateFlags() []mcnflag.Flag {
@@ -140,6 +145,12 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "ECS_VPC_PRIVATE_IP",
 		},
 		mcnflag.StringFlag{
+			Name:   "aliyunecs-description",
+			Usage:  "Description for instance",
+			Value:  "",
+			EnvVar: "ECS_DESCRIPTION",
+		},
+		mcnflag.StringFlag{
 			Name:   "aliyunecs-ssh-password",
 			Usage:  "set the password of the ssh user",
 			EnvVar: "ECS_SSH_PASSWORD",
@@ -178,14 +189,31 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "ECS_DISK_SIZE",
 		},
 		mcnflag.StringFlag{
+			Name:   "aliyunecs-system-disk-category",
+			Usage:  "System disk category for instance",
+			EnvVar: "ECS_SYSTEM_DISK_CATEGORY",
+		},
+		mcnflag.StringFlag{
 			Name:   "aliyunecs-disk-category",
 			Usage:  "Data disk category for instance",
 			EnvVar: "ECS_DISK_CATEGORY",
 		},
 		mcnflag.BoolFlag{
 			Name:   "aliyunecs-upgrade-kernel",
-			Usage:  "Upgrade kernel for instance",
+			Usage:  "Upgrade kernel for instance (Ubuntu 14.04 only)",
 			EnvVar: "ECS_UPGRADE_KERNEL",
+		},
+		mcnflag.StringFlag{
+			Name:   "aliyunecs-io-optimized",
+			Usage:  "I/O optimized instance",
+			Value:  "",
+			EnvVar: "ECS_IO_OPTIMIZED",
+		},
+		mcnflag.StringFlag{
+			Name:   "aliyunecs-api-endpoint",
+			Usage:  "Custom API endpoint",
+			Value:  "",
+			EnvVar: "ECS_API_ENDPOINT",
 		},
 	}
 }
@@ -239,9 +267,18 @@ func (d *Driver) GetImageID(image string) string {
 }
 
 func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	region, err := validateECSRegion(flags.String("aliyunecs-region"))
-	if err != nil {
-		return err
+	d.APIEndpoint = flags.String("aliyunecs-api-endpoint")
+	var region common.Region
+	var err error
+	regionId := flags.String("aliyunecs-region")
+	if d.APIEndpoint != "" {
+		// Ignore the Region validation
+		region = common.Region(regionId)
+	} else {
+		region, err = validateECSRegion(flags.String("aliyunecs-region"))
+		if err != nil {
+			return err
+		}
 	}
 	d.AccessKey = flags.String("aliyunecs-access-key-id")
 	d.SecretKey = flags.String("aliyunecs-access-key-secret")
@@ -251,7 +288,6 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.VpcId = flags.String("aliyunecs-vpc-id")
 	d.VSwitchId = flags.String("aliyunecs-vswitch-id")
 	d.SecurityGroupName = flags.String("aliyunecs-security-group")
-
 	d.Zone = flags.String("aliyunecs-zone")
 	d.SwarmMaster = flags.Bool("swarm-master")
 	d.SwarmHost = flags.String("swarm-host")
@@ -267,6 +303,16 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.DiskCategory = ecs.DiskCategory(flags.String("aliyunecs-disk-category"))
 	tags := flags.StringSlice("aliyunecs-tag")
 	d.UpgradeKernel = flags.Bool("aliyunecs-upgrade-kernel")
+
+	ioOptimized := strings.ToLower(flags.String("aliyunecs-io-optimized"))
+
+	d.IoOptimized = (ioOptimized == "true" || ioOptimized == "optimized")
+	d.Description = flags.String("aliyunecs-description")
+	d.SystemDiskCategory = ecs.DiskCategory(flags.String("aliyunecs-system-disk-category"))
+
+	if d.SystemDiskCategory == "" && d.IoOptimized {
+		d.SystemDiskCategory = ecs.DiskCategoryCloudSSD
+	}
 
 	tagMap := make(map[string]string)
 	if len(tags) > 0 {
@@ -330,6 +376,11 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		swarmPort = port
 	}
 
+	if d.APIEndpoint != "" {
+		if d.SLBID != "" {
+			return fmt.Errorf("Unsupport 'aliyunecs-slb-id' flag when the custom API endpoint is specified")
+		}
+	}
 	return nil
 }
 
@@ -384,9 +435,15 @@ func (d *Driver) Create() error {
 	imageID := d.GetImageID(d.ImageID)
 	log.Infof("%s | Creating instance with image %s ...", d.MachineName, imageID)
 
+	ioOptimized := ecs.IoOptimizedNone
+	if d.IoOptimized {
+		ioOptimized = ecs.IoOptimizedOptimized
+	}
+
 	args := ecs.CreateInstanceArgs{
 		RegionId:           d.Region,
 		InstanceName:       d.GetMachineName(),
+		Description:        d.Description,
 		ImageId:            imageID,
 		InstanceType:       d.InstanceType,
 		SecurityGroupId:    d.SecurityGroupId,
@@ -394,7 +451,12 @@ func (d *Driver) Create() error {
 		Password:           d.SSHPassword,
 		VSwitchId:          VSwitchId,
 		ZoneId:             d.Zone,
+		IoOptimized:        ioOptimized,
 		ClientToken:        d.getClient().GenerateClientToken(),
+	}
+
+	if d.SystemDiskCategory != "" {
+		args.SystemDisk.Category = d.SystemDiskCategory
 	}
 
 	if d.DiskSize > 0 { // Allocate Data Disk
@@ -872,6 +934,9 @@ func (d *Driver) getSLBClient() *slb.Client {
 func (d *Driver) getClient() *ecs.Client {
 	if d.client == nil {
 		client := ecs.NewClient(d.AccessKey, d.SecretKey)
+		if d.APIEndpoint != "" {
+			client.SetEndpoint(d.APIEndpoint)
+		}
 		client.SetDebug(false)
 		d.client = client
 	}
