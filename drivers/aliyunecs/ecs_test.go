@@ -168,14 +168,14 @@ func TestGetPrivateIP(t *testing.T) {
 	var instance ecs.InstanceAttributesType
 	instance.InnerIpAddress.IpAddress = []string{"192.168.1.100"}
 
-	if d.getPrivateIP(&instance) != "192.168.1.100" {
+	if d.GetPrivateIP(&instance) != "192.168.1.100" {
 		t.Error("getPrivateIP failed")
 	}
 
 	var instance2 ecs.InstanceAttributesType
 	instance2.VpcAttributes.PrivateIpAddress.IpAddress = []string{"172.168.1.100"}
 
-	if d.getPrivateIP(&instance2) != "172.168.1.100" {
+	if d.GetPrivateIP(&instance2) != "172.168.1.100" {
 		t.Error("getPrivateIP failed")
 	}
 
